@@ -1,0 +1,243 @@
+#Parte 1 - coordenadas e variaveis
+# prepare r -------------------------------------------------------------
+# packages
+if(!require(udunits2)) install.packages("udunits2")
+if(!require(tidyverse)) install.packages("tidyverse")
+if(!require(rnaturalearthdata)) install.packages("rnaturalearthdata")
+if(!require(rnaturalearth)) install.packages("rnaturalearth")
+if(!require(nngeo)) install.packages("nngeo")
+if(!require(sf)) install.packages("sf")
+if(!require(tmap)) install.packages("tmap")
+if(!require(spocc)) install.packages("spocc")
+if(!require(CoordinateCleaner)) install.packages("CoordinateCleaner")
+if(!require(spThin)) install.packages("spThin")
+if(!require(mapview)) install.packages("mapview")
+if(!require(mapedit)) install.packages("mapedit")
+if(!require(raster)) install.packages("raster")
+if(!require(viridis)) install.packages("viridis")
+if(!require(usdm)) install.packages("usdm")
+if(!require(ENMTools)) install.packages("ENMTools")
+#baixar ENMTools direto da aba Tools - install packages
+
+
+# options
+options(timeout = 1e5)
+options(scipen = 50)
+
+
+# directories 
+#dir.create("03_dados")
+#dir.create("03_dados/01_ocorrencias")
+#dir.create("03_dados/02_variaveis")
+#dir.create("03_dados/03_limite")
+
+# 1. occurrences ----------------------------------------------------------
+
+#limite da distribuição 
+li <- sf::st_read("03_dados/03_limite/america_do_sul_recorte.shp")
+li
+
+tm_shape(li) +
+  tm_polygons()
+
+# download ----
+# species
+sp <- "Tadarida brasiliensis"
+sp
+
+#ocorrências da espécie
+occ <- readr::read_csv("03_dados/01_ocorrencias/occ_data.csv")
+occ
+
+# map
+occ_data_vector <- occ %>%
+  tidyr::drop_na(longitude, latitude) %>%
+  dplyr::mutate(lon = longitude, lat = latitude) %>%
+  dplyr::filter(lon >= -180, lon <= 180, lat >= -90, lat <= 90) %>%
+  sf::st_as_sf(coords = c("lon", "lat"), crs = 4326)
+occ_data_vector
+
+tm_shape(li, bbox = occ_data_vector) +
+  tm_polygons() +
+  tm_shape(occ_data_vector) +
+  tm_dots(size = .2, shape = 21, col = "steelblue") +
+  tm_graticules(lines = FALSE)
+
+
+#spatial limit filter ----
+# crop to limit
+occ_data_sptlim <- occ_data_vector %>%
+  dplyr::mutate(sptlim_filter = as.logical(sf::st_intersects(occ_data_vector, li, sparse = FALSE)))
+occ_data_sptlim
+
+# map
+tm_shape(li) +
+  tm_polygons() +
+  tm_shape(occ_data_sptlim %>%
+             filter(sptlim_filter == TRUE)) +
+  tm_dots(size = .2, shape = 21, col = "steelblue")
+
+# bias filter ----
+occ_data_sptlim_date_bias <- CoordinateCleaner::clean_coordinates(
+  x = sf::st_drop_geometry(occ_data_sptlim),
+  species = "species",
+  lon = "longitude",
+  lat = "latitude",
+  outliers_mtp = 2,
+  tests = c("duplicates", # records from one species with identical coordinates
+    "validity", # outside reference coordinate system
+    "zeros" # plain zeros and lat = lon
+  )) %>%
+  tibble::as_tibble() %>%
+  dplyr::mutate(lon = longitude, lat = latitude) %>%
+  sf::st_as_sf(coords = c("lon", "lat"), crs = 4326)
+occ_data_sptlim_date_bias
+
+# map
+tm_shape(li) +
+  tm_polygons() +
+  tm_shape(occ_data_sptlim_date_bias %>%
+             filter(sptlim_filter == TRUE,
+                    .summary == TRUE)) +
+  tm_dots(size = .2, shape = 21, col = "steelblue")
+
+# spatial distance filter ---
+filter_thin <- spThin::thin(loc.data = occ_data_sptlim_date_bias,
+                            lat.col = "latitude",
+                            long.col = "longitude",
+                            spec.col = "species",
+                            thin.par = 10,
+                            reps = 1,
+                            write.files = FALSE,
+                            write.log.file = FALSE,
+                            locs.thinned.list.return = TRUE,
+                            verbose = TRUE) %>%
+  .[[1]] %>%
+  tibble::as_tibble() %>%
+  dplyr::rename_with(tolower) %>%
+  dplyr::mutate(sptdist_filter = TRUE)
+filter_thin
+
+# join
+occ_data_sptlim_date_bias_sptdist <- dplyr::left_join(
+  x = occ_data_sptlim_date_bias,
+  y = filter_thin,
+  by = c("longitude", "latitude")) %>%
+  dplyr::mutate(sptdist_filter = replace_na(sptdist_filter, FALSE)) %>%
+  dplyr::relocate(sptdist_filter)
+occ_data_sptlim_date_bias_sptdist
+
+# map
+tm_shape(li) +
+  tm_polygons() +
+  tm_shape(occ_data_sptlim_date_bias_sptdist %>%
+             filter(sptlim_filter == TRUE,
+                    sptdist_filter == TRUE,
+                    .summary == TRUE)) +
+  tm_dots(size = .2, shape = 21, col = "steelblue")
+
+## apply filters ----
+occ_data_filter <- occ_data_sptlim_date_bias_sptdist %>%
+  filter(sptlim_filter == TRUE,
+         sptdist_filter == TRUE,
+         .summary == TRUE) %>%
+  dplyr::select(species, longitude, latitude)
+occ_data_filter
+
+mapview::mapview(occ_data_filter)
+
+# manual editing ----
+occ_data_filter_edit <-  mapedit::editFeatures(occ_data_filter) #atenção para o Done!
+occ_data_filter_edit
+
+#não esqueça de clicar no stop para continuar
+
+# export ----
+# vetor
+occ_data_filter %>%
+  sf::st_write("03_dados/01_ocorrencias/occ_data_filter.shp")
+
+# tabela
+
+occ_data_filter %>%
+  sf::st_drop_geometry() %>%
+  readr::write_csv2("03_dados/01_ocorrencias/occ_data_filter.csv")
+
+#-----------------------------------------------------
+# 2. variables ------------------------------------------------------------
+# variables ----
+
+# import
+env <- dir(path = "03_dados/02_variaveis", pattern = ".tif$", full.names = TRUE) %>%
+  raster::stack() %>%
+  raster::brick()
+env
+
+# rename
+#names(env)
+#names(env) <- c("var01", paste0("var", 10:24), paste0("var0", 2:9))
+#names(env)
+#env
+
+# plot
+plot(env$var24)
+
+# extent and resolution ----
+# adjust extent and resolution
+env_li <- env %>%
+  raster::crop(li) %>%
+  raster::mask(li) %>%
+  raster::aggregate(fact = .10/res(env)[1])
+env_li
+
+# plot
+tm_shape(env_li$var02) +
+  tm_raster(palette = "-RdBu", n = 5) +
+  tm_shape(li) +
+  tm_borders(col = "black") +
+  tm_layout(legend.position = c("right", "bottom"))
+
+# collinearity ----
+# correlation
+ENMTools::raster.cor.matrix(env_li, method = "spearman")
+ENMTools::raster.cor.plot(env_li)
+
+#-----------para excluir variaveis com correlação alta
+# vif
+env_li_vif <- usdm::vif(env_li)
+env_li_vif
+
+# vifstep
+#env_li_vifstep <- usdm::vifstep(env_li, th = 2)
+#env_li_vifstep
+
+# vifcor 
+env_li_vifcor <- usdm::vifcor(env_li, th = .7)
+env_li_vifcor
+
+# select
+#env_li_vif <- usdm::exclude(env_li, env_li_vifstep)
+#env_li_vif
+
+env_li_cor <- usdm::exclude(env_li, env_li_vifcor)
+env_li_cor
+
+# scale dos rasters--------------------------------------------
+env_li_scale <- raster::scale(env_li)
+env_li_scale
+
+# plot
+plot(env_li, col = viridis::viridis(100))
+plot(env_li_scale, col = viridis::viridis(100))
+
+# export -------------------------------------------
+# directories
+dir.create("03_dados/04_raster")
+
+raster::writeRaster(x = env_li_scale,
+                    filename = paste0("03_dados/04_raster/", names(env_li_scale)),
+                    bylayer = TRUE,
+                    format = "GTiff",
+                    overwrite = TRUE)
+
+# end ---------------------------------------------------------------------

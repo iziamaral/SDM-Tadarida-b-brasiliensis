@@ -1,0 +1,549 @@
+#Parte 2 - modelagem
+# prepare r -------------------------------------------------------------
+# packages
+if(!require(udunits2)) install.packages("udunits2")
+if(!require(tidyverse)) install.packages("tidyverse")
+if(!require(rnaturalearth)) install.packages("rnaturalearth")
+if(!require(nngeo)) install.packages("nngeo")
+if(!require(sf)) install.packages("sf")
+if(!require(tmap)) install.packages("tmap")
+if(!require(mapview)) install.packages("mapview")
+if(!require(raster)) install.packages("raster")
+if(!require(viridis)) install.packages("viridis")
+if(!require(dismo)) install.packages("dismo")
+if(!require(gam)) install.packages("gam")
+if(!require(kernlab)) install.packages("kernlab")
+if(!require(e1071)) install.packages("e1071")
+if(!require(randomForest)) install.packages("randomForest")
+if(!require(sdm)) install.packages("sdm")
+if(!require(ggspatial)) install.packages("ggspatial")
+
+
+# options
+options(timeout = 1e5)
+
+# maxent
+#https://consbiol-unibern.github.io/SDMtune/ acessar para tirar dúvidas
+#tem que instalar o rJava e o Java JDK
+
+if(!require(rJava)) install.packages("rJava")
+
+download.file(url = "https://biodiversityinformatics.amnh.org/open_source/maxent/maxent.php?op=download",
+              destfile = paste0(system.file("java", package = "dismo"), "/maxent.zip"), mode = "wb")
+unzip(zipfile = paste0(system.file("java", package = "dismo"), "/maxent.zip"),
+      exdir = system.file("java", package = "dismo"), junkpaths = TRUE)
+dir(system.file("java", package = "dismo"))
+
+
+# directories
+dir.create("01_modelos")
+
+# dismo ------------------------------------------------------------------
+# data ----
+li <- sf::st_read("03_dados/03_limite/america_do_sul_recorte.shp")
+li
+
+tm_shape(li) +
+  tm_polygons()
+
+occ <- readr::read_csv2("03_dados/01_ocorrencias/occ_data_filter.csv")
+occ
+
+env <- dir(path = "03_dados/04_raster/", pattern = ".tif", full.names = TRUE) %>%
+  raster::stack() %>%
+  raster::brick()
+env
+
+tm_shape(env$var08) +
+  tm_raster(pal = "RdBu") +
+  tm_shape(li) +
+  tm_borders(col = "black") +
+  tm_shape(occ %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
+  tm_bubbles(size = .1, col = "steelblue") +
+  tm_layout(legend.position = c("right", "bottom"))
+
+# criar mascara sem ocorrencias
+pr_buffer <- occ %>%
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  sf::st_buffer(dist = 10000) %>%
+  sf::st_union() %>%
+  sf::as_Spatial()
+pr_buffer
+
+
+plot(li)
+plot(pr_buffer, col = "gray", add= TRUE)
+
+env_mask_buffer <- raster::mask(env$var08, pr_buffer, inverse = TRUE)
+env_mask_buffer
+
+tm_shape(env_mask_buffer) +
+  tm_raster() +
+  tm_shape(occ %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
+  tm_bubbles(size = .02, col = "steelblue") +
+  tm_layout(legend.show = FALSE)
+
+
+# selecting presence and pseudo-absence data ----
+pr_specie <- occ %>%
+  dplyr::select(longitude, latitude) %>%
+  dplyr::mutate(id = seq(nrow(.)))
+pr_specie
+
+set.seed(42)
+pa_specie <- dismo::randomPoints(mask = env_mask_buffer, n = nrow(pr_specie)) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(longitude = x, latitude = y) %>%
+  dplyr::mutate(id = seq(nrow(.)))
+pa_specie
+
+set.seed(42)
+bkg <- dismo::randomPoints(mask = env, n = 7000, warn = FALSE) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(longitude = x, latitude = y)
+bkg
+
+tm_shape(li) +
+  tm_borders(col = "black") +
+  tm_shape(bkg %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
+  tm_bubbles(size = .1, col = "gray") +
+  tm_shape(pr_specie %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
+  tm_bubbles(size = .1, col = "steelblue") +
+  tm_shape(pa_specie %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
+  tm_bubbles(size = .1, col = "orange")
+
+# partitioning data ----
+pr_sample_train <- pr_specie %>%
+  dplyr::sample_frac(.7) %>%
+  dplyr::select(id) %>%
+  dplyr::pull()
+pr_sample_train
+
+pa_sample_train <- pa_specie %>%
+  dplyr::sample_frac(.7) %>%
+  dplyr::select(id) %>%
+  dplyr::pull()
+pa_sample_train
+
+# train and test data
+train_pa <- dismo::prepareData(x = env, p = pr_specie[pr_specie$id %in% pr_sample_train, 1:2], b = pa_specie[pa_specie$id %in% pa_sample_train, 1:2])
+
+
+train_pa
+nrow(train_pa)
+table(train_pa$pb)
+
+train_pb <- dismo::prepareData(x = env,
+                               p = pr_specie[pr_specie$id %in% pr_sample_train, 1:2],
+                               b = bkg)
+train_pb
+nrow(train_pb)
+table(train_pb$pb)
+
+test_pa <- dismo::prepareData(x = env,
+                              p = pr_specie[!pr_specie$id %in% pr_sample_train, 1:2],
+                              b = pa_specie[!pa_specie$id %in% pa_sample_train, 1:2])
+test_pa
+nrow(test_pa)
+table(test_pa$pb)
+
+
+# 3. model fitting ----
+# presence-only - envelope
+BIO <- dismo::bioclim(x = train_pa[train_pa$pb == 1, -1])
+plot(BIO, a = 1, b = 2, p = 0.85)
+plot(BIO, a = 1, b = 2, p = 0.95)
+plot(BIO, a = 1, b = 2, p = 1)
+
+# presence-absence - statistics
+GLM <- glm(formula = pb ~ ., data = train_pa, family = "binomial")
+GLM
+summary(GLM)
+
+
+# presence-absence - machine learning
+SVM <- e1071::svm(formula = pb ~ ., data = train_pa)
+SVM
+
+
+# presence-background
+Sys.setenv(NOAWT = TRUE)
+MAX <- dismo::maxent(x = train_pb[, -1], p = train_pb[, 1])
+MAX
+plot(MAX)
+
+
+# 4. evaluation ----
+# eval bioclim
+eval_BIO <- dismo::evaluate(p = test_pa[test_pa$pb == 1, -1],
+                            a = test_pa[test_pa$pb == 0, -1],
+                            model = BIO)
+eval_BIO
+plot(eval_BIO, "ROC")
+
+dismo::threshold(eval_BIO, "spec_sens")
+id_eval_spec_sens_BIO <- which(eval_BIO@t == dismo::threshold(eval_BIO, "spec_sens"))
+tss_spec_sens_BIO <- eval_BIO@TPR[id_eval_spec_sens_BIO] + eval_BIO@TNR[id_eval_spec_sens_BIO] - 1
+tss_spec_sens_BIO
+
+
+# eval glm
+eval_GLM <- dismo::evaluate(p = test_pa[test_pa$pb == 1, -1],
+                            a = test_pa[test_pa$pb == 0, -1],
+                            model = GLM)
+eval_GLM
+plot(eval_GLM, "ROC")
+
+dismo::threshold(eval_GLM, "spec_sens")
+id_eval_spec_sens_GLM <- which(eval_GLM@t == dismo::threshold(eval_GLM, "spec_sens"))
+tss_spec_sens_GLM <- eval_GLM@TPR[id_eval_spec_sens_GLM] + eval_GLM@TNR[id_eval_spec_sens_GLM] - 1
+tss_spec_sens_GLM
+
+# eval svm
+eval_SVM <- dismo::evaluate(p = test_pa[test_pa$pb == 1, -1],
+                            a = test_pa[test_pa$pb == 0, -1],
+                            model = SVM)
+eval_SVM
+plot(eval_SVM, "ROC")
+
+dismo::threshold(eval_SVM, "spec_sens")
+id_eval_spec_sens_SVM <- which(eval_SVM@t == dismo::threshold(eval_SVM, "spec_sens"))
+tss_spec_sens_SVM <- eval_SVM@TPR[id_eval_spec_sens_SVM] + eval_SVM@TNR[id_eval_spec_sens_SVM] - 1
+tss_spec_sens_SVM
+
+# eval maxent
+eval_MAX <-dismo::evaluate(p = test_pa[test_pa$pb == 1, -1],
+                           a = test_pa[test_pa$pb == 0, -1],
+                           model = MAX)
+eval_MAX
+plot(eval_MAX, "ROC")
+
+dismo::threshold(eval_MAX, "spec_sens")
+id_eval_spec_sens_MAX <- which(eval_MAX@t == dismo::threshold(eval_MAX, "spec_sens"))
+tss_spec_sens_MAX <- eval_MAX@TPR[id_eval_spec_sens_MAX] + eval_MAX@TNR[id_eval_spec_sens_MAX] - 1
+tss_spec_sens_MAX
+
+# evaluations
+eval <- tibble::tibble(method = c("BIO", "GLM", "SVM", "MAX"),
+                       auc = c(eval_BIO@auc, eval_GLM@auc, eval_SVM@auc, eval_MAX@auc),
+                       tss = c(tss_spec_sens_BIO, tss_spec_sens_GLM,tss_spec_sens_SVM, tss_spec_sens_MAX),
+                       thr = c(dismo::threshold(eval_BIO, "spec_sens"), dismo::threshold(eval_GLM, "spec_sens"),
+                               dismo::threshold(eval_SVM, "spec_sens"), dismo::threshold(eval_MAX, "spec_sens")))
+eval
+
+# 5.  predict ----
+# bioclim
+model_predict_bio <- dismo::predict(env, BIO, progress = "text")
+model_predict_bio
+
+model_predict_bio_thr <- model_predict_bio >= eval[1, ]$thr
+model_predict_bio_thr
+
+plot(model_predict_bio, col = viridis::turbo(100), main = "BIOCLIM - Contínuo")
+plot(model_predict_bio_thr, col = c("gray", "blue"), main = "BIOCLIM - Binário")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+# glm
+model_predict_glm <- dismo::predict(env, GLM, progress = "text")
+model_predict_glm
+
+model_predict_glm_thr <- model_predict_glm >= eval[3, ]$thr
+model_predict_glm_thr
+
+plot(model_predict_glm, col = viridis::turbo(100), main = "GLM - Contínuo")
+plot(model_predict_glm_thr, col = c("gray", "blue"), main = "GLM - Binário")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+
+# svm
+model_predict_svm <- dismo::predict(env, SVM, progress = "text", type = "response")
+model_predict_svm
+
+model_predict_svm_thr <- model_predict_svm >= eval[4, ]$thr
+model_predict_svm_thr
+
+plot(model_predict_svm, col = viridis::turbo(100), main = "SVM - Contínuo")
+plot(model_predict_svm_thr, col = c("gray", "blue"), main = "SVM - Binário")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+# maxent
+model_predict_max <- dismo::predict(env, MAX, progress = "text", type = "response")
+model_predict_max
+
+model_predict_max_thr <- model_predict_max >= eval[4, ]$thr
+model_predict_max_thr
+
+plot(model_predict_max, col = viridis::turbo(100), main = "MaxEnt - Contínuo")
+plot(model_predict_max_thr, col = c("gray", "blue"), main = "MaxEnt - Binário")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+# 6. ensembles ---- - 
+# models ----
+models_cont <- raster::stack(model_predict_bio, model_predict_glm, model_predict_svm, model_predict_max)
+models_cont
+
+models_bin <- raster::stack(model_predict_bio_thr, model_predict_glm_thr, model_predict_svm_thr, model_predict_max_thr)
+models_bin
+
+
+# frequency ---- 
+ens_freq <- sum(models_bin)/nlayers(models_bin)
+ens_freq
+plot(ens_freq, col = viridis::turbo(100), main = "Ensemble - Frequência")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+points(occ$longitude, occ$latitude, cex = .7, pch = 20, col = "black")
+
+# standard deviation
+ens_freq_sd <- raster::calc(models_bin, sd)
+ens_freq_sd
+plot(ens_freq_sd, col = viridis::turbo(100), main = "Ensemble - Frequência - Desvio padrão")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+par(mfrow = c(1, 2))
+plot(ens_freq, col = viridis::turbo(100), main = "Ensemble - Frequência")
+plot(ens_freq_sd, col = viridis::turbo(100), main = "Ensemble - Frequência - Desvio padrão")
+dev.off()
+
+# mean ---- 
+ens_mean <- mean(models_cont)
+ens_mean
+plot(ens_mean, col = viridis::turbo(100), main = "Ensemble - Frequência")
+
+models_cont_pad <- raster::stack()
+for(i in 1:nlayers(models_cont)){
+  
+  models_cont_pad <- raster::stack(models_cont_pad, climateStability::rescale0to1(models_cont[[i]]))
+}
+models_cont_pad
+
+# mean
+ens_mean_pad <- mean(models_cont_pad)
+ens_mean_pad
+plot(ens_mean_pad, col = viridis::turbo(100), main = "Ensemble - Média")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+# standard deviation
+ens_mean_pad_sd <- raster::calc(models_cont_pad, sd)
+ens_mean_pad_sd
+plot(ens_mean_pad_sd, col = viridis::turbo(100), main = "Ensemble - Média - Desvio padrão")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+# weighted mean
+w_auc <- (eval$auc-0.5)^2 #retirar 0.5 (aleatorio) e eleva ao quadrado para valores muito altos
+ens_wei_mean_auc <- weighted.mean(models_cont_pad, w_auc)
+plot(ens_wei_mean_auc, col = viridis::turbo(100), main = "Ensemble - Média pondera pelo AUC")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+w_tss <- (eval$tss-0.5)^2 #retirar 0.5 (aleatorio) e eleva ao quadrado para valores muito altos
+ens_wei_mean_tss <- weighted.mean(models_cont_pad, w_tss)
+plot(ens_wei_mean_tss, col = viridis::turbo(100), main = "Ensemble - Média pondera pelo AUC")
+points(occ$longitude, occ$latitude, pch = 20, col = "steelblue")
+
+par(mfrow = c(1, 2))
+plot(ens_freq, col = viridis::turbo(100), main = "Ensemble - Frequência")
+plot(ens_mean_pad, col = viridis::turbo(100), main = "Ensemble - Média")
+plot(ens_wei_mean_auc, col = viridis::turbo(100), main = "Ensemble - Média ponderada AUC")
+plot(ens_wei_mean_tss, col = viridis::turbo(100), main = "Ensemble - Média ponderada TSS")
+dev.off()
+
+# sdm ---------------------------------------------------------------------
+# 1. import data ----
+# occurrence
+occ <- readr::read_csv2("03_dados/01_ocorrencias/occ_data_filter.csv")
+
+occ_sp <- occ %>%
+  dplyr::mutate(species = 1)
+coordinates(occ_sp) <- c("longitude", "latitude")
+occ_sp
+
+# variables
+env <- dir(path = "03_dados/04_raster", pattern = ".tif", full.names = TRUE) %>%
+  raster::stack() %>%
+  raster::brick()
+env
+
+
+# 2. data preparation -----------------------------------------------------
+# prepare data
+sdm_data <- sdm::sdmData(formula = species~.,
+                         train = occ_sp,
+                         predictors = env,
+                         bg = list(n = nrow(occ),
+                                   method = "gRandom", # "eRandom"
+                                   remove = TRUE))
+sdm_data
+
+# 3. model fitting --------------------------------------------------------
+# methods
+sdm::getmethodNames()
+sdm::getmethodNames() %>% names()
+
+# parallel
+parallel::detectCores()
+
+# fit
+sdm_fit <- sdm::sdm(species ~ .,
+                    data = sdm_data,
+                    replication = "subsampling",
+                    n = 20,#quantas vezes roda para cada modelo
+                    test.percent = 30,
+                    parallelSetting = list(ncores = 3, method = "parallel"),
+                    methods = c(
+                      "bioclim.dismo",
+                      "glm",
+                      "maxent",
+                        "svm"
+                    ))
+sdm_fit
+
+# information
+sdm::getModelInfo(sdm_fit)
+
+# 4. assessment of model -------------------------------------------------
+# evaluation
+sdm::getEvaluation(sdm_fit, opt = 2)
+
+# roc
+x11()
+sdm::roc(sdm_fit)
+sdm::roc(sdm_fit, method = "maxent")
+sdm::roc(sdm_fit, method = "svm")
+sdm::roc(sdm_fit, method = "glm")
+sdm::roc(sdm_fit, method = "bioclim.dismo", smooth = TRUE)
+
+# response curve #ver o número do id de cada teste para mudar o 41:50
+sdm::rcurve(sdm_fit) + theme_bw()
+sdm::rcurve(sdm_fit, id = 21:40) + theme_bw()
+
+# variable importance
+sdm::getVarImp(sdm_fit)
+sdm::getVarImp(sdm_fit, method = "svm")
+sdm::getVarImp(sdm_fit, method = "maxent")
+
+sdm_var_import <- sdm::getVarImp(sdm_fit)
+sdm_var_import
+
+plot(sdm_var_import) + theme_bw()
+
+# 5. predictions -----------------------------------------------------------
+
+# predict
+sdm_predict <- predict(object = sdm_fit,
+                       newdata = env,
+                       filename = "01_modelos/predict.tif",
+                       mean = TRUE,
+                       nc = 3, #quantos cores usar
+                       overwrite = TRUE)
+sdm_predict
+
+# names
+names(sdm_predict)
+
+# map
+plot(sdm_predict, col = viridis::turbo(100))
+
+# 6. ensemble ----------------------------------------------------------------
+# ensemble
+ens <- sdm::ensemble(x = sdm_fit,
+                     newdata = env,
+                     filename = "01_modelos/ensemble.tif",
+                     parallelSetting = list(ncores = 3, method = "parallel"),
+                     setting = list(
+                       method = "weighted",
+                       stat = "TSS",
+                       opt = 2
+                     ))
+ens
+plot(ens, col = viridis::turbo(100))
+
+
+
+# uncertainty
+unc <- sdm::ensemble(x = sdm_fit,
+                     newdata = env,
+                     filename = "01_modelos/uncertainty.tif",
+                     setting = list(
+                       #id = c(1:14, 19:32), poderia listas qual modelo usar
+                       method = "uncertainty",
+                       stat = "TSS",
+                       opt = 2
+                     ))
+unc
+plot(unc, col = viridis::turbo(100))
+
+# 7. threshold ---------------------------------------------------------------
+# evaluations
+evaluation <- sdm::getEvaluation(sdm_fit, stat = c("AUC", "TSS", "threshold"), opt = 2)
+evaluation
+
+# threshold max(se+sp)
+thr <- mean(evaluation$threshold)
+thr
+
+# cut
+ens_thr <- ens >= thr
+ens_thr
+
+# plot
+plot(ens_thr, col = c("gray", "blue"))
+
+# 8. maps -----------------------------------------------------------------
+# data
+da <- raster::rasterToPoints(ens) %>%
+  tibble::as_tibble()
+da
+
+map_sui <- ggplot() +
+  geom_raster(data = da, aes(x, y, fill = ensemble)) +
+  geom_sf(data = li, fill = NA, color = "gray30") +
+  geom_point(data = occ, aes(x = longitude, y = latitude)) +
+  scale_color_manual(values = "black", guide = guide_legend(order = 1)) +
+  scale_fill_gradientn(colours = viridis::turbo(100)) +
+  coord_sf(xlim = sf::st_bbox(li)[c(1, 3)], ylim = sf::st_bbox(li)[c(2, 4)]) +
+  labs(x = "Longitude", y = "Latitude", fill = "Suitability") +
+  annotation_scale(location = "br", width_hint = .3) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         pad_x = unit(.3, "cm"), pad_y = unit(.3, "cm"),
+                         style = north_arrow_fancy_orienteering) +
+  theme_bw() +
+  theme(legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 10),
+        legend.background = element_rect(fill = "white",
+                                         size = 0.3,
+                                         linetype = "solid",
+                                         colour = "black"),
+        axis.title = element_text(size = 12, face = "plain"),
+        legend.position = c(.85, .17))
+map_sui
+
+# data potential
+# threshold
+da_thr <- ens_thr %>%
+  raster::rasterToPoints() %>%
+  tibble::as_tibble()
+da_thr
+
+map_sui_thr <- ggplot() +
+  geom_raster(data = da_thr, aes(x, y, fill = layer)) +
+  geom_sf(data = li, fill = NA, color = "gray30") +
+  geom_point(data = occ, aes(x = longitude, y = latitude)) +
+  scale_color_manual(values = "black", guide = guide_legend(order = 1)) +
+  scale_fill_gradientn(colours = c("gray", "blue")) +
+  coord_sf(xlim = sf::st_bbox(li)[c(1, 4)], ylim = sf::st_bbox(li)[c(2, 4)]) +
+  labs(x = "Longitude", y = "Latitude", fill = "Suitability") +
+  annotation_scale(location = "br", width_hint = .3) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         pad_x = unit(.3, "cm"), pad_y = unit(.3, "cm"),
+                         style = north_arrow_fancy_orienteering) +
+  theme_bw() +
+  theme(legend.title = element_text(size =12, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.background = element_rect(fill = "white",
+                                         size = 0.3,
+                                         linetype = "solid",
+                                         colour = "black"),
+        axis.title = element_text(size = 10, face = "plain"),
+        legend.position = c(.85, .40))
+map_sui_thr
+
+# end ---------------------------------------------------------------------
